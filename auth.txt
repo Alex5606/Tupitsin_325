@@ -1,0 +1,161 @@
+package com.example.messenger
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Bundle
+import android.util.Base64
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.Fragment
+import com.bumptech.glide.Glide
+import com.example.messenger.databinding.FragmentProfileBinding
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
+import java.io.ByteArrayOutputStream
+
+class ProfileFragment : Fragment() {
+
+    private var _binding: FragmentProfileBinding? = null
+    private val binding get() = _binding!!
+
+    private val auth = FirebaseAuth.getInstance()
+    private val db = FirebaseFirestore.getInstance()
+
+    private var selectedImageUri: Uri? = null
+
+    private val imagePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            selectedImageUri = it
+            Glide.with(this).load(it).into(binding.ivProfilePhoto)
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentProfileBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        loadUserData()
+        setupListeners()
+    }
+
+    private fun loadUserData() {
+        val userId = auth.currentUser?.uid ?: return
+
+        db.collection("users").document(userId).get()
+            .addOnSuccessListener { doc ->
+                binding.etName.setText(doc.getString("name"))
+                binding.tvEmail.text = doc.getString("email")
+                binding.etBio.setText(doc.getString("bio"))
+
+                val photoUrl = doc.getString("photoUrl")
+                if (!photoUrl.isNullOrEmpty()) {
+                    // Base64 или URL
+                    if (photoUrl.length > 500) {
+                        try {
+                            val imageBytes = Base64.decode(photoUrl, Base64.DEFAULT)
+                            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                            binding.ivProfilePhoto.setImageBitmap(bitmap)
+                        } catch (e: Exception) {
+                            binding.ivProfilePhoto.setImageResource(R.drawable.ic_avatar)
+                        }
+                    } else {
+                        Glide.with(this)
+                            .load(photoUrl)
+                            .placeholder(R.drawable.ic_avatar)
+                            .into(binding.ivProfilePhoto)
+                    }
+                }
+            }
+    }
+
+    private fun setupListeners() {
+        binding.btnBack.setOnClickListener {
+            parentFragmentManager.popBackStack()
+        }
+
+        binding.btnEditPhoto.setOnClickListener {
+            imagePickerLauncher.launch("image/*")
+        }
+
+        binding.btnSave.setOnClickListener {
+            saveProfile()
+        }
+
+        binding.btnLogout.setOnClickListener {
+            auth.signOut()
+            requireActivity().finish()
+        }
+    }
+
+    private fun saveProfile() {
+        val name = binding.etName.text.toString().trim()
+        val bio = binding.etBio.text.toString().trim()
+
+        if (name.isEmpty()) {
+            Toast.makeText(context, "Введите имя", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        binding.btnSave.isEnabled = false
+        binding.btnSave.text = "Сохранение..."
+
+        val userId = auth.currentUser?.uid ?: return
+
+        val updates = mutableMapOf<String, Any>(
+            "name" to name,
+            "bio" to bio
+        )
+
+        // Если выбрано новое фото - конвертируем в Base64
+        if (selectedImageUri != null) {
+            try {
+                val inputStream = requireContext().contentResolver.openInputStream(selectedImageUri!!)
+                val bitmap = BitmapFactory.decodeStream(inputStream)
+                inputStream?.close()
+
+                val stream = ByteArrayOutputStream()
+                val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 400, 400, true)
+                scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 60, stream)
+                val byteArray = stream.toByteArray()
+                val base64Image = Base64.encodeToString(byteArray, Base64.DEFAULT)
+
+                updates["photoUrl"] = base64Image
+            } catch (e: Exception) {
+                Toast.makeText(context, "Ошибка обработки фото", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        db.collection("users").document(userId)
+            .update(updates)
+            .addOnSuccessListener {
+                binding.btnSave.isEnabled = true
+                binding.btnSave.text = "Сохранить изменения"
+                Toast.makeText(context, "Профиль обновлен", Toast.LENGTH_SHORT).show()
+                selectedImageUri = null
+            }
+            .addOnFailureListener {
+                binding.btnSave.isEnabled = true
+                binding.btnSave.text = "Сохранить изменения"
+                Toast.makeText(context, "Ошибка сохранения", Toast.LENGTH_SHORT).show()
+            }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

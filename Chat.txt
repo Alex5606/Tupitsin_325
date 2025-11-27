@@ -1,0 +1,356 @@
+package com.example.messenger
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Bundle
+import android.util.Base64
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.Fragment
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.example.messenger.databinding.FragmentChatBinding
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.SetOptions
+import java.io.ByteArrayOutputStream
+import java.util.*
+
+class ChatFragment : Fragment() {
+
+    private var _binding: FragmentChatBinding? = null
+    private val binding get() = _binding!!
+
+    private var db: FirebaseFirestore? = null
+    private var auth: FirebaseAuth? = null
+    private var currentUserId: String = ""
+
+    private var otherUserId: String = ""
+    private var chatId: String = ""
+
+    private var adapter: MessagesAdapter? = null
+
+    private val galleryLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            try {
+                sendImage(it)
+            } catch (e: Exception) {
+                showError("Ошибка выбора фото: ${e.message}")
+            }
+        }
+    }
+
+    companion object {
+        fun newInstance(userId: String, userName: String) = ChatFragment().apply {
+            arguments = Bundle().apply {
+                putString("userId", userId)
+                putString("userName", userName)
+            }
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View? {
+        return try {
+            _binding = FragmentChatBinding.inflate(inflater, container, false)
+            binding.root
+        } catch (e: Exception) {
+            showError("Ошибка создания: ${e.message}")
+            null
+        }
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        try {
+            // Инициализация Firebase
+            auth = FirebaseAuth.getInstance()
+            db = FirebaseFirestore.getInstance()
+
+            currentUserId = auth?.currentUser?.uid ?: ""
+            otherUserId = arguments?.getString("userId") ?: ""
+            val userName = arguments?.getString("userName") ?: ""
+
+            if (currentUserId.isEmpty()) {
+                showError("Пользователь не авторизован")
+                return
+            }
+
+            if (otherUserId.isEmpty()) {
+                showError("ID собеседника пустой")
+                return
+            }
+
+            chatId = getChatId(currentUserId, otherUserId)
+
+            binding.tvUserName.text = userName
+
+            binding.btnBack.setOnClickListener {
+                parentFragmentManager.popBackStack()
+            }
+
+            setupRecyclerView()
+            setupButtons()
+            loadMessages()
+
+        } catch (e: Exception) {
+            showError("Ошибка инициализации: ${e.message}")
+        }
+    }
+
+    private fun setupRecyclerView() {
+        try {
+            adapter = MessagesAdapter(currentUserId,
+                onMessageLongClick = { message ->
+                    try {
+                        showMessageOptions(message)
+                    } catch (e: Exception) {
+                        showError("Ошибка опций: ${e.message}")
+                    }
+                },
+                onImageClick = { imageUrl ->
+                    try {
+                        showImageFullscreen(imageUrl)
+                    } catch (e: Exception) {
+                        showError("Ошибка просмотра: ${e.message}")
+                    }
+                }
+            )
+            binding.recyclerView.layoutManager = LinearLayoutManager(context)
+            binding.recyclerView.adapter = adapter
+        } catch (e: Exception) {
+            showError("Ошибка RecyclerView: ${e.message}")
+        }
+    }
+
+    private fun setupButtons() {
+        binding.btnSend.setOnClickListener {
+            try {
+                sendMessage()
+            } catch (e: Exception) {
+                showError("Ошибка отправки: ${e.message}")
+            }
+        }
+
+        binding.btnAttach.setOnClickListener {
+            try {
+                galleryLauncher.launch("image/*")
+            } catch (e: Exception) {
+                showError("Ошибка галереи: ${e.message}")
+            }
+        }
+    }
+
+    private fun sendMessage() {
+        val text = binding.etMessage.text?.toString()?.trim() ?: ""
+        if (text.isEmpty()) {
+            return
+        }
+
+        if (currentUserId.isEmpty()) {
+            showError("currentUserId пустой")
+            return
+        }
+
+        if (chatId.isEmpty()) {
+            showError("chatId пустой")
+            return
+        }
+
+        val messageId = UUID.randomUUID().toString()
+        val message = hashMapOf(
+            "id" to messageId,
+            "text" to text,
+            "senderId" to currentUserId,
+            "timestamp" to System.currentTimeMillis(),
+            "type" to "TEXT",
+            "imageUrl" to "",
+            "isRead" to false
+        )
+
+        db?.collection("chats")?.document(chatId)
+            ?.collection("messages")
+            ?.document(messageId)
+            ?.set(message)
+            ?.addOnSuccessListener {
+                binding.etMessage.setText("")
+                updateChatInfo(text)
+            }
+            ?.addOnFailureListener { e ->
+                showError("Firebase ошибка: ${e.message}")
+            }
+    }
+
+    private fun sendImage(imageUri: Uri) {
+        if (currentUserId.isEmpty() || chatId.isEmpty()) {
+            showError("Нет ID пользователя или чата")
+            return
+        }
+
+        try {
+            val inputStream = requireContext().contentResolver.openInputStream(imageUri)
+            val bitmap = BitmapFactory.decodeStream(inputStream)
+            inputStream?.close()
+
+            if (bitmap == null) {
+                showError("Не удалось загрузить фото")
+                return
+            }
+
+            val stream = ByteArrayOutputStream()
+            val width = minOf(bitmap.width, 800)
+            val height = (bitmap.height * width / bitmap.width)
+            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, width, height, true)
+            scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 50, stream)
+            val byteArray = stream.toByteArray()
+            val base64Image = Base64.encodeToString(byteArray, Base64.DEFAULT)
+
+            val messageId = UUID.randomUUID().toString()
+            val message = hashMapOf(
+                "id" to messageId,
+                "text" to "",
+                "senderId" to currentUserId,
+                "timestamp" to System.currentTimeMillis(),
+                "type" to "IMAGE",
+                "imageUrl" to base64Image,
+                "isRead" to false
+            )
+
+            db?.collection("chats")?.document(chatId)
+                ?.collection("messages")
+                ?.document(messageId)
+                ?.set(message)
+                ?.addOnSuccessListener {
+                    updateChatInfo("📷 Фото")
+                }
+                ?.addOnFailureListener { e ->
+                    showError("Ошибка отправки фото: ${e.message}")
+                }
+
+        } catch (e: Exception) {
+            showError("Ошибка обработки фото: ${e.message}")
+        }
+    }
+
+    private fun showMessageOptions(message: Message) {
+        val options = mutableListOf("Копировать")
+        if (message.senderId == currentUserId) {
+            options.add("Удалить")
+        }
+
+        androidx.appcompat.app.AlertDialog.Builder(requireContext())
+            .setItems(options.toTypedArray()) { _, which ->
+                when (options[which]) {
+                    "Копировать" -> {
+                        val clipboard = requireContext().getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("message", message.text))
+                        Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+                    }
+                    "Удалить" -> {
+                        db?.collection("chats")?.document(chatId)
+                            ?.collection("messages")
+                            ?.document(message.id)
+                            ?.delete()
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun showImageFullscreen(imageUrl: String) {
+        val fragment = ImageViewerFragment.newInstance(imageUrl)
+        parentFragmentManager.beginTransaction()
+            .add(android.R.id.content, fragment)
+            .addToBackStack(null)
+            .commit()
+    }
+
+    private fun updateChatInfo(lastMessage: String) {
+        if (chatId.isEmpty()) return
+
+        db?.collection("chats")?.document(chatId)
+            ?.set(hashMapOf(
+                "users" to listOf(currentUserId, otherUserId),
+                "lastMessage" to lastMessage,
+                "timestamp" to System.currentTimeMillis()
+            ))
+    }
+
+    private fun loadMessages() {
+        if (chatId.isEmpty()) {
+            showError("chatId пустой при загрузке")
+            return
+        }
+
+        db?.collection("chats")?.document(chatId)
+            ?.collection("messages")
+            ?.orderBy("timestamp", Query.Direction.ASCENDING)
+            ?.addSnapshotListener { snapshot, error ->
+                if (_binding == null) return@addSnapshotListener
+
+                if (error != null) {
+                    showError("Ошибка загрузки: ${error.message}")
+                    return@addSnapshotListener
+                }
+
+                try {
+                    val messages = snapshot?.documents?.mapNotNull { doc ->
+                        try {
+                            Message(
+                                id = doc.getString("id") ?: doc.id,
+                                text = doc.getString("text") ?: "",
+                                senderId = doc.getString("senderId") ?: "",
+                                timestamp = doc.getLong("timestamp") ?: 0,
+                                type = try { MessageType.valueOf(doc.getString("type") ?: "TEXT") } catch (e: Exception) { MessageType.TEXT },
+                                imageUrl = doc.getString("imageUrl") ?: ""
+                            )
+                        } catch (e: Exception) {
+                            null
+                        }
+                    } ?: emptyList()
+
+                    adapter?.submitList(messages)
+
+                    if (messages.isNotEmpty()) {
+                        binding.recyclerView.postDelayed({
+                            if (_binding != null) {
+                                binding.recyclerView.scrollToPosition(messages.size - 1)
+                            }
+                        }, 100)
+                    }
+                } catch (e: Exception) {
+                    showError("Ошибка парсинга: ${e.message}")
+                }
+            }
+    }
+
+    private fun getChatId(userId1: String, userId2: String): String {
+        return if (userId1 < userId2) "${userId1}_$userId2" else "${userId2}_$userId1"
+    }
+
+    private fun showError(message: String) {
+        try {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            // Ignore
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
